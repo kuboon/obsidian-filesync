@@ -1,0 +1,18 @@
+{
+    "name": "obsidian-filesync-plugin",
+    "version": "0.1.0",
+    "type": "module",
+    "scripts": {
+        "dev": "esbuild src/main.ts --bundle --outfile=main.js --format=esm --external:obsidian --platform=browser --watch",
+        "build": "esbuild src/main.ts --bundle --outfile=main.js --format=esm --external:obsidian --platform=browser --minify"
+    },
+    "dependencies": {
+        "trystero": "^0.21.3"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "esbuild": "^0.24.0",
+        "obsidian": "^1.7.2",
+        "typescript": "^5.7.0"
+    }
+}

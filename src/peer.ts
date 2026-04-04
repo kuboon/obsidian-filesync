@@ -16,8 +16,8 @@ import {
     getFile,
     putFile,
     deleteFile,
+    watchFiles,
 } from "./filesync.ts";
-import { SyncManager } from "./sync.ts";
 import type { FileChangeEvent } from "./filesync.ts";
 
 export interface Advertisement {
@@ -30,40 +30,69 @@ export class FileSyncPeer {
     private room: Room | null = null;
     private rpcServer = new RPCServer();
     private rpcClients = new Map<string, RPCClient>();
-    private syncManager: SyncManager;
     private sendRpc!: (data: Payload, peerId?: string) => void;
     private sendAd!: (data: Advertisement, peerId?: string) => void;
+    private sendNotify!: (data: FileChangeEvent, peerId?: string) => void;
     private selfId = crypto.randomUUID().slice(0, 20);
+    private watchedScopes = new Set<string>();
 
     constructor(private config: Config) {
-        this.syncManager = new SyncManager(config.vaultDir);
         this.registerHandlers();
     }
 
     private registerHandlers(): void {
-        this.rpcServer.register("listFiles", () => listFiles(this.config.vaultDir));
-
-        this.rpcServer.register("getFileHashes", () =>
-            getFileHashes(this.config.vaultDir),
+        // All RPC handlers take scope as first arg
+        this.rpcServer.register("listFiles", (scope: unknown) =>
+            listFiles(this.config.vaultDir, scope as string),
         );
 
-        this.rpcServer.register("getFile", (path: unknown) =>
-            getFile(this.config.vaultDir, path as string),
+        this.rpcServer.register("getFileHashes", (scope: unknown) =>
+            getFileHashes(this.config.vaultDir, scope as string),
         );
 
-        this.rpcServer.register("putFile", async (path: unknown, data: unknown, mtime: unknown) => {
-            await putFile(this.config.vaultDir, path as string, data as string | number[], mtime as number);
-            return { ok: true };
-        });
+        this.rpcServer.register("getFile", (scope: unknown, path: unknown) =>
+            getFile(this.config.vaultDir, scope as string, path as string),
+        );
 
-        this.rpcServer.register("deleteFile", async (path: unknown) => {
-            await deleteFile(this.config.vaultDir, path as string);
+        this.rpcServer.register(
+            "putFile",
+            async (scope: unknown, path: unknown, data: unknown, mtime: unknown) => {
+                await putFile(
+                    this.config.vaultDir,
+                    scope as string,
+                    path as string,
+                    data as string | number[],
+                    mtime as number,
+                );
+                this.ensureWatching(scope as string);
+                return { ok: true };
+            },
+        );
+
+        this.rpcServer.register("deleteFile", async (scope: unknown, path: unknown) => {
+            await deleteFile(this.config.vaultDir, scope as string, path as string);
             return { ok: true };
         });
     }
 
+    /** Start watching a scope directory for local changes if not already watching */
+    private ensureWatching(scope: string): void {
+        if (this.watchedScopes.has(scope)) return;
+        this.watchedScopes.add(scope);
+
+        (async () => {
+            console.log(`[peer] Watching scope "${scope}" for local changes`);
+            for await (const event of watchFiles(this.config.vaultDir, scope)) {
+                // Broadcast change to all peers
+                this.sendNotify(event);
+            }
+        })().catch((err) => {
+            console.error(`[peer] Watch error for scope "${scope}":`, err);
+            this.watchedScopes.delete(scope);
+        });
+    }
+
     async start(): Promise<void> {
-        // Ensure vault directory exists
         await Deno.mkdir(this.config.vaultDir, { recursive: true });
 
         console.log(`[peer] Joining room: ${this.config.roomId}`);
@@ -79,13 +108,15 @@ export class FileSyncPeer {
             this.config.roomId,
         );
 
-        // Set up RPC action
+        // Set up actions
         const [sendRpc, onRpc] = this.room.makeAction<Payload>("rpc");
         this.sendRpc = sendRpc as (data: Payload, peerId?: string) => void;
 
-        // Set up advertisement action
         const [sendAd, onAd] = this.room.makeAction<Advertisement>("ad");
         this.sendAd = sendAd as (data: Advertisement, peerId?: string) => void;
+
+        const [sendNotify, onNotify] = this.room.makeAction<FileChangeEvent>("notify");
+        this.sendNotify = sendNotify as (data: FileChangeEvent, peerId?: string) => void;
 
         // Handle incoming RPC messages
         onRpc((payload: Payload, peerId: string) => {
@@ -99,39 +130,42 @@ export class FileSyncPeer {
             }
         });
 
-        // Handle advertisements
         onAd((ad: Advertisement, peerId: string) => {
             console.log(`[peer] Advertisement from ${ad.name} (${peerId})`);
         });
 
-        // Set up change notification action
-        const [sendNotify, onNotify] = this.room.makeAction<FileChangeEvent>("notify");
+        // Change notifications from remote peers — apply locally
+        onNotify(async (event: FileChangeEvent, peerId: string) => {
+            const client = this.rpcClients.get(peerId);
+            if (!client) return;
 
-        // Handle incoming change notifications from remote peers
-        onNotify((event: FileChangeEvent, peerId: string) => {
-            console.log(`[peer] Change notification from ${peerId}: ${event.kind} ${event.path}`);
-            this.syncManager.handleRemoteChange(peerId, event).catch((err) => {
-                console.error(`[peer] Failed to handle remote change:`, err);
-            });
+            const key = `${event.scope}/${event.path}`;
+            console.log(`[peer] Remote change: ${event.kind} ${key}`);
+
+            try {
+                if (event.kind === "remove") {
+                    await deleteFile(this.config.vaultDir, event.scope, event.path);
+                } else {
+                    const fileData = (await client.call("getFile", [event.scope, event.path], peerId)) as {
+                        data: string | number[];
+                        mtime: number;
+                    };
+                    await putFile(this.config.vaultDir, event.scope, event.path, fileData.data, fileData.mtime);
+                }
+            } catch (err) {
+                console.error(`[peer] Failed to apply remote change ${key}:`, err);
+            }
         });
 
-        // Wire up local change notifications to broadcast to peers
-        this.syncManager.setNotifyFn((event: FileChangeEvent) => {
-            sendNotify(event);
-        });
-
-        // Handle peer join
+        // Peer lifecycle
         this.room.onPeerJoin((peerId: string) => {
             console.log(`[peer] Peer joined: ${peerId}`);
 
-            // Create RPC client for this peer
             const client = new RPCClient((payload: Request, targetPeerId?: string) => {
                 this.sendRpc(payload, targetPeerId ?? peerId);
             });
             this.rpcClients.set(peerId, client);
-            this.syncManager.addPeer(peerId, client);
 
-            // Send our advertisement
             this.sendAd(
                 {
                     peerId: this.selfId,
@@ -140,28 +174,14 @@ export class FileSyncPeer {
                 },
                 peerId,
             );
-
-            // Trigger full sync after a short delay
-            setTimeout(() => {
-                this.syncManager.syncWithPeer(peerId).catch((err) => {
-                    console.error(`[peer] Initial sync failed:`, err);
-                });
-            }, 2000);
         });
 
-        // Handle peer leave
         this.room.onPeerLeave((peerId: string) => {
             console.log(`[peer] Peer left: ${peerId}`);
             this.rpcClients.delete(peerId);
-            this.syncManager.removePeer(peerId);
         });
 
         console.log(`[peer] Connected to relay. Waiting for peers...`);
-
-        // Start watching filesystem for changes
-        this.syncManager.startWatching().catch((err) => {
-            console.error(`[peer] File watcher error:`, err);
-        });
     }
 
     stop(): void {

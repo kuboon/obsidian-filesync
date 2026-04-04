@@ -1,0 +1,9 @@
+{
+    "id": "obsidian-filesync",
+    "name": "FileSync",
+    "version": "0.1.0",
+    "minAppVersion": "1.0.0",
+    "description": "Sync vault folders with a remote server via P2P relay (Trystero/Nostr)",
+    "author": "kuboon",
+    "isDesktopOnly": false
+}

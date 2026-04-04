@@ -1,0 +1,12 @@
+{
+    "name": "obsidian-filesync",
+    "version": "0.1.0",
+    "type": "module",
+    "description": "P2P file sync server for Obsidian via Trystero/Nostr relay",
+    "dependencies": {
+        "node-datachannel": "^0.26.0",
+        "trystero": "^0.21.3"
+    },
+    "author": "kuboon",
+    "license": "MIT"
+}

@@ -1,0 +1,20 @@
+{
+    "tasks": {
+        "install": "npm ci",
+        "main": "deno run -A src/main.ts",
+        "dev": "deno run -A --env=.env src/main.ts"
+    },
+    "imports": {
+        "trystero/nostr": "npm:trystero@^0.21.3/nostr",
+        "trystero": "npm:trystero@^0.21.3",
+        "node-datachannel": "npm:node-datachannel@^0.26.0",
+        "node-datachannel/polyfill": "npm:node-datachannel@^0.26.0/polyfill",
+        "@std/path": "jsr:@std/path@^1",
+        "@std/fs/walk": "jsr:@std/fs@^1/walk"
+    },
+    "nodeModulesDir": "manual",
+    "unstable": [
+        "sloppy-imports",
+        "bare-node-builtins"
+    ]
+}

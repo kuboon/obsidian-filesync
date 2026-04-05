@@ -14,9 +14,8 @@ import type { SyncEngine } from "./sync";
 
 export class FileSyncPeer {
     private room: Room | null = null;
-    private rpcClient: RPCClient | null = null;
+    private rpcClients = new Map<string, RPCClient>();
     private rpcServer = new RPCServer();
-    private connectedPeerId: string | null = null;
     private sendRpc!: (data: Payload, peerId?: string) => void;
     private sendNotify!: (data: FileChangeEvent, peerId?: string) => void;
     private selfId = crypto.randomUUID().slice(0, 20);
@@ -27,22 +26,53 @@ export class FileSyncPeer {
     constructor(
         private settings: FileSyncSettings,
         private syncEngine: SyncEngine,
-    ) {}
+    ) {
+        this.registerRPCHandlers();
+    }
 
     get isConnected(): boolean {
         return this.room !== null;
     }
 
-    get currentPeerId(): string | null {
-        return this.connectedPeerId;
+    get connectedPeerIds(): string[] {
+        return [...this.rpcClients.keys()];
     }
 
-    get client(): RPCClient | null {
-        return this.rpcClient;
+    getClient(peerId: string): RPCClient | undefined {
+        return this.rpcClients.get(peerId);
     }
 
     updateSettings(settings: FileSyncSettings): void {
         this.settings = settings;
+    }
+
+    /** Register RPC handlers so other peers can call us */
+    private registerRPCHandlers(): void {
+        this.rpcServer.register("getFileHashes", (scope: unknown) =>
+            this.syncEngine.getLocalHashesForScope(scope as string),
+        );
+
+        this.rpcServer.register("getFile", (scope: unknown, path: unknown) =>
+            this.syncEngine.getLocalFile(scope as string, path as string),
+        );
+
+        this.rpcServer.register(
+            "putFile",
+            async (scope: unknown, path: unknown, data: unknown, mtime: unknown) => {
+                await this.syncEngine.putLocalFile(
+                    scope as string,
+                    path as string,
+                    data as string | number[],
+                    mtime as number,
+                );
+                return { ok: true };
+            },
+        );
+
+        this.rpcServer.register("deleteFile", async (scope: unknown, path: unknown) => {
+            await this.syncEngine.deleteLocalFile(scope as string, path as string);
+            return { ok: true };
+        });
     }
 
     connect(): void {
@@ -64,52 +94,49 @@ export class FileSyncPeer {
             this.settings.roomId,
         );
 
-        // RPC action
         const [sendRpc, onRpc] = this.room.makeAction<Payload>("rpc");
         this.sendRpc = sendRpc as (data: Payload, peerId?: string) => void;
 
-        // Advertisement action
         const [sendAd, onAd] = this.room.makeAction<Advertisement>("ad");
 
-        // Notify action
         const [sendNotify, onNotify] = this.room.makeAction<FileChangeEvent>("notify");
         this.sendNotify = sendNotify as (data: FileChangeEvent, peerId?: string) => void;
 
-        // Handle incoming RPC
+        // Handle incoming RPC — dispatch to server or match to client response
         onRpc((payload: Payload, peerId: string) => {
             if (payload.direction === DIRECTION_REQUEST) {
                 this.rpcServer.dispatch(payload, (resp: Response) => {
                     this.sendRpc(resp, peerId);
                 });
             } else if (payload.direction === DIRECTION_RESPONSE) {
-                this.rpcClient?.handleResponse(payload);
+                const client = this.rpcClients.get(peerId);
+                client?.handleResponse(payload);
             }
         });
 
-        // Handle advertisements
         onAd((ad: Advertisement, peerId: string) => {
             console.log(`[filesync] Advertisement from ${ad.name} (${peerId})`);
         });
 
-        // Handle remote change notifications
+        // Remote change notifications
         onNotify((event: FileChangeEvent, peerId: string) => {
-            if (!this.rpcClient) return;
+            const client = this.rpcClients.get(peerId);
+            if (!client) return;
             console.log(`[filesync] Remote notify: ${event.kind} ${event.scope}/${event.path}`);
-            this.syncEngine.handleRemoteChange(event, peerId, this.rpcClient).catch((err) => {
+            this.syncEngine.handleRemoteChange(event, peerId, client).catch((err) => {
                 console.error(`[filesync] Failed to handle remote change:`, err);
             });
         });
 
-        // Peer lifecycle
+        // Peer lifecycle — support multiple peers
         this.room.onPeerJoin((peerId: string) => {
             console.log(`[filesync] Peer joined: ${peerId}`);
-            this.connectedPeerId = peerId;
 
-            this.rpcClient = new RPCClient((payload: Request, targetPeerId?: string) => {
+            const client = new RPCClient((payload: Request, targetPeerId?: string) => {
                 this.sendRpc(payload, targetPeerId ?? peerId);
             });
+            this.rpcClients.set(peerId, client);
 
-            // Send our advertisement
             (sendAd as (data: Advertisement, peerId?: string) => void)(
                 {
                     peerId: this.selfId,
@@ -121,10 +148,11 @@ export class FileSyncPeer {
 
             this.onPeerConnected?.(peerId);
 
-            // Auto-sync
             if (this.settings.autoSync) {
                 setTimeout(() => {
-                    this.syncEngine.fullSync(peerId, this.rpcClient!).catch((err) => {
+                    const c = this.rpcClients.get(peerId);
+                    if (!c) return;
+                    this.syncEngine.fullSync(peerId, c).catch((err) => {
                         console.error("[filesync] Auto-sync failed:", err);
                     });
                 }, 2000);
@@ -133,10 +161,7 @@ export class FileSyncPeer {
 
         this.room.onPeerLeave((peerId: string) => {
             console.log(`[filesync] Peer left: ${peerId}`);
-            if (this.connectedPeerId === peerId) {
-                this.connectedPeerId = null;
-                this.rpcClient = null;
-            }
+            this.rpcClients.delete(peerId);
             this.onPeerDisconnected?.(peerId);
         });
 
@@ -146,16 +171,24 @@ export class FileSyncPeer {
     disconnect(): void {
         this.room?.leave();
         this.room = null;
-        this.rpcClient = null;
-        this.connectedPeerId = null;
+        this.rpcClients.clear();
         console.log("[filesync] Disconnected");
     }
 
-    /** Trigger full sync manually */
+    /** Broadcast a change notification to all connected peers */
+    broadcastChange(event: FileChangeEvent): void {
+        if (this.sendNotify) {
+            this.sendNotify(event);
+        }
+    }
+
+    /** Trigger full sync with all peers */
     async triggerSync(): Promise<void> {
-        if (!this.connectedPeerId || !this.rpcClient) {
+        if (this.rpcClients.size === 0) {
             throw new Error("Not connected to any peer");
         }
-        await this.syncEngine.fullSync(this.connectedPeerId, this.rpcClient);
+        for (const [peerId, client] of this.rpcClients) {
+            await this.syncEngine.fullSync(peerId, client);
+        }
     }
 }

@@ -1,5 +1,5 @@
 import { Plugin, TFile, Notice } from "obsidian";
-import type { FileSyncSettings } from "./types";
+import type { FileSyncSettings, FileChangeEvent } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { SyncEngine } from "./sync";
 import { FileSyncPeer } from "./peer";
@@ -24,10 +24,8 @@ export default class FileSyncPlugin extends Plugin {
             new Notice(`FileSync: disconnected from ${peerId}`);
         };
 
-        // Add settings tab
         this.addSettingTab(new FileSyncSettingTab(this.app, this));
 
-        // Add commands
         this.addCommand({
             id: "connect",
             name: "Connect to relay",
@@ -67,40 +65,54 @@ export default class FileSyncPlugin extends Plugin {
             },
         });
 
-        // Watch vault changes and push to server
+        // Watch vault changes — push to ALL connected peers
+        const pushChange = (file: TFile, deleted: boolean) => {
+            const resolved = this.syncEngine.resolveVaultPath(file.path);
+            if (!resolved) return;
+
+            // Broadcast notification to all peers
+            const event: FileChangeEvent = {
+                kind: deleted ? "remove" : "modify",
+                path: resolved.relativePath,
+                scope: resolved.pair.serverScope,
+            };
+            this.peer.broadcastChange(event);
+
+            // Push data to each peer
+            for (const peerId of this.peer.connectedPeerIds) {
+                const client = this.peer.getClient(peerId);
+                if (!client) continue;
+                this.syncEngine
+                    .handleLocalChange(file, peerId, client, deleted)
+                    .catch((err) => console.error(`[filesync] Push to ${peerId} failed:`, err));
+            }
+        };
+
         this.registerEvent(
             this.app.vault.on("modify", (file) => {
-                if (!(file instanceof TFile)) return;
-                if (!this.peer.currentPeerId || !this.peer.client) return;
-                this.syncEngine
-                    .handleLocalChange(file, this.peer.currentPeerId, this.peer.client)
-                    .catch((err) => console.error("[filesync] Push failed:", err));
+                if (file instanceof TFile) pushChange(file, false);
             }),
         );
 
         this.registerEvent(
             this.app.vault.on("create", (file) => {
-                if (!(file instanceof TFile)) return;
-                if (!this.peer.currentPeerId || !this.peer.client) return;
-                this.syncEngine
-                    .handleLocalChange(file, this.peer.currentPeerId, this.peer.client)
-                    .catch((err) => console.error("[filesync] Push failed:", err));
+                if (file instanceof TFile) pushChange(file, false);
             }),
         );
 
         this.registerEvent(
             this.app.vault.on("delete", (file) => {
-                if (!(file instanceof TFile)) return;
-                if (!this.peer.currentPeerId || !this.peer.client) return;
-                this.syncEngine
-                    .handleLocalChange(file, this.peer.currentPeerId, this.peer.client, true)
-                    .catch((err) => console.error("[filesync] Delete push failed:", err));
+                if (file instanceof TFile) pushChange(file, true);
             }),
         );
 
         // Auto-connect on load
-        if (this.settings.autoSync && this.settings.roomId && this.settings.passphrase && this.settings.syncPairs.length > 0) {
-            // Delay to let Obsidian finish loading
+        if (
+            this.settings.autoSync &&
+            this.settings.roomId &&
+            this.settings.passphrase &&
+            this.settings.syncPairs.length > 0
+        ) {
             setTimeout(() => this.peer.connect(), 3000);
         }
     }

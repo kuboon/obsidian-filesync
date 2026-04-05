@@ -32,7 +32,9 @@ export class SyncEngine {
         this.pairs = pairs;
     }
 
-    /** Check if a vault path belongs to any sync pair, return the pair and relative path */
+    // ─── Path resolution ──────────────────────────────────────────
+
+    /** Check if a vault path belongs to any sync pair */
     resolveVaultPath(vaultPath: string): { pair: SyncPair; relativePath: string } | null {
         for (const pair of this.pairs) {
             const prefix = pair.vaultFolder.endsWith("/") ? pair.vaultFolder : pair.vaultFolder + "/";
@@ -53,7 +55,12 @@ export class SyncEngine {
         return normalizePath(pair.vaultFolder + "/" + relativePath);
     }
 
-    /** Suppress FS events caused by our own writes */
+    private pairForScope(scope: string): SyncPair | undefined {
+        return this.pairs.find((p) => p.serverScope === scope);
+    }
+
+    // ─── Suppress echo ───────────────────────────────────────────
+
     markRemotePut(vaultPath: string): void {
         this.recentRemotePuts.set(vaultPath, Date.now());
     }
@@ -65,28 +72,88 @@ export class SyncEngine {
         return false;
     }
 
-    /** Full sync for all pairs */
+    // ─── RPC server methods (called by remote peers) ─────────────
+
+    /** Serve: return hashes for a given scope */
+    async getLocalHashesForScope(scope: string): Promise<Record<string, string>> {
+        const pair = this.pairForScope(scope);
+        if (!pair) return {};
+        return this.getLocalHashes(pair);
+    }
+
+    /** Serve: return file content for a given scope + path */
+    async getLocalFile(scope: string, relativePath: string): Promise<FileData> {
+        const vaultPath = this.toVaultPath(scope, relativePath);
+        if (!vaultPath) throw new Error(`Unknown scope: ${scope}`);
+
+        const file = this.vault.getAbstractFileByPath(vaultPath);
+        if (!(file instanceof TFile)) throw new Error(`File not found: ${vaultPath}`);
+
+        if (isTextFile(vaultPath)) {
+            const text = await this.vault.read(file);
+            return { data: text, mtime: file.stat.mtime };
+        } else {
+            const buf = await this.vault.readBinary(file);
+            return { data: Array.from(new Uint8Array(buf)), mtime: file.stat.mtime };
+        }
+    }
+
+    /** Serve: write a file from remote peer */
+    async putLocalFile(scope: string, relativePath: string, data: string | number[], mtime: number): Promise<void> {
+        const vaultPath = this.toVaultPath(scope, relativePath);
+        if (!vaultPath) throw new Error(`Unknown scope: ${scope}`);
+
+        this.markRemotePut(vaultPath);
+
+        if (typeof data === "string") {
+            const existing = this.vault.getAbstractFileByPath(vaultPath);
+            if (existing instanceof TFile) {
+                await this.vault.modify(existing, data);
+            } else {
+                await this.vault.create(vaultPath, data);
+            }
+        } else {
+            const binary = new Uint8Array(data).buffer;
+            const existing = this.vault.getAbstractFileByPath(vaultPath);
+            if (existing instanceof TFile) {
+                await this.vault.modifyBinary(existing, binary);
+            } else {
+                await this.vault.createBinary(vaultPath, binary);
+            }
+        }
+    }
+
+    /** Serve: delete a file requested by remote peer */
+    async deleteLocalFile(scope: string, relativePath: string): Promise<void> {
+        const vaultPath = this.toVaultPath(scope, relativePath);
+        if (!vaultPath) return;
+
+        this.markRemotePut(vaultPath);
+        const existing = this.vault.getAbstractFileByPath(vaultPath);
+        if (existing instanceof TFile) {
+            await this.vault.delete(existing);
+        }
+    }
+
+    // ─── Sync orchestration (client role) ────────────────────────
+
+    /** Full sync for all pairs with a peer */
     async fullSync(peerId: string, client: RPCClient): Promise<void> {
         for (const pair of this.pairs) {
             await this.syncPair(peerId, client, pair);
         }
     }
 
-    /** Sync a single pair */
+    /** Sync a single pair: bidirectional hash-based diff */
     async syncPair(peerId: string, client: RPCClient, pair: SyncPair): Promise<void> {
-        console.log(`[filesync] Syncing: vault:${pair.vaultFolder} ↔ server:${pair.serverScope}`);
+        console.log(`[filesync] Syncing: vault:${pair.vaultFolder} ↔ scope:${pair.serverScope}`);
 
-        // Get remote file hashes
-        const remoteHashes = (await client.call(
-            "getFileHashes",
-            [pair.serverScope],
-            peerId,
-        )) as Record<string, string>;
+        const [localHashes, remoteHashes] = await Promise.all([
+            this.getLocalHashes(pair),
+            client.call("getFileHashes", [pair.serverScope], peerId) as Promise<Record<string, string>>,
+        ]);
 
-        // Get local file hashes
-        const localHashes = await this.getLocalHashes(pair);
-
-        // Pull: remote has file we don't or differs
+        // Pull: remote has file we don't, or content differs
         for (const [path, remoteHash] of Object.entries(remoteHashes)) {
             if (localHashes[path] !== remoteHash) {
                 await this.pullFile(peerId, client, pair, path);
@@ -103,7 +170,7 @@ export class SyncEngine {
         new Notice(`FileSync: synced ${pair.vaultFolder}`);
     }
 
-    private async getLocalHashes(pair: SyncPair): Promise<Record<string, string>> {
+    async getLocalHashes(pair: SyncPair): Promise<Record<string, string>> {
         const hashes: Record<string, string> = {};
         const prefix = pair.vaultFolder.endsWith("/") ? pair.vaultFolder : pair.vaultFolder + "/";
 
@@ -165,7 +232,9 @@ export class SyncEngine {
         await client.call("putFile", [pair.serverScope, relativePath, data, file.stat.mtime], peerId);
     }
 
-    /** Handle a vault file change event — push to server if it belongs to a sync pair */
+    // ─── Local change handling (push to peers) ───────────────────
+
+    /** Handle a vault file change — push to a specific peer */
     async handleLocalChange(
         file: TFile,
         peerId: string,
@@ -186,6 +255,8 @@ export class SyncEngine {
         }
     }
 
+    // ─── Remote change handling (pull from peer) ─────────────────
+
     /** Handle a remote change notification */
     async handleRemoteChange(
         event: FileChangeEvent,
@@ -203,7 +274,7 @@ export class SyncEngine {
                 await this.vault.delete(existing);
             }
         } else {
-            const pair = this.pairs.find((p) => p.serverScope === event.scope);
+            const pair = this.pairForScope(event.scope);
             if (!pair) return;
             await this.pullFile(peerId, client, pair, event.path);
         }
